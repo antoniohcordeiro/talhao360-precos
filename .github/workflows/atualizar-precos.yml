@@ -1,0 +1,71 @@
+name: Atualizar precos CONAB
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  atualizar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Gerar precos-conab.json
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const URL = 'https://portaldeinformacoes.conab.gov.br/downloads/arquivos/PrecosSemanalUF.txt';
+            const nomeDe = (c0) => {
+              const p = c0.trim();
+              if (p === 'SOJA') return 's';
+              if (p === 'MILHO') return 'm';
+              if (p.startsWith('ALGOD') && p.includes('PLUMA')) return 'a';
+              return null;
+            };
+            const resp = await fetch(URL);
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            const buf = Buffer.from(await resp.arrayBuffer());
+            const text = buf.toString('latin1');
+            const lines = text.split('\n');
+            const best = {};
+            for (const line of lines) {
+              const c = line.split(';');
+              if (c.length < 11) continue;
+              const nome = nomeDe(c[0]);
+              if (!nome) continue;
+              if ((nome === 's' || nome === 'm') && !c[1].includes('EM GR')) continue;
+              if (!c[9].includes('RECEBIDO')) continue;
+              const uf = c[3].trim();
+              const ano = +c[5], mes = +c[6], sem = +c[8];
+              const val = parseFloat((c[10] || '').trim().replace(',', '.'));
+              if (!ano || !isFinite(val) || val <= 0) continue;
+              const key = ano * 10000 + mes * 100 + sem;
+              best[uf] = best[uf] || {};
+              if (!best[uf][nome] || key > best[uf][nome].key) best[uf][nome] = { key, val, sem: c[7].trim() };
+            }
+            const weekCount = {};
+            for (const u in best) for (const n in best[u]) { const w = best[u][n].sem; weekCount[w] = (weekCount[w] || 0) + 1; }
+            let semanaComum = '', mx = 0;
+            for (const w in weekCount) if (weekCount[w] > mx) { mx = weekCount[w]; semanaComum = w; }
+            const uf = {};
+            for (const u in best) {
+              const o = {}; let w = '';
+              for (const nome of ['s','m','a']) { const b = best[u][nome]; if (b) { o[nome] = b.val; w = b.sem; } }
+              if (Object.keys(o).length) { if (w && w !== semanaComum) o.w = w; uf[u] = o; }
+            }
+            const out = { gerado: new Date().toISOString().slice(0,10), fonte: 'CONAB', semana: semanaComum, uf };
+            fs.writeFileSync('precos-conab.json', JSON.stringify(out));
+            console.log('Estados:', Object.keys(uf).length, '| Semana:', semanaComum);
+
+      - name: Publicar se mudou
+        run: |
+          git config user.name "conab-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add precos-conab.json
+          git commit -m "Atualiza precos CONAB" || echo "Sem mudancas."
+          git push
